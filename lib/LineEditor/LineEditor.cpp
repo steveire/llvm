@@ -15,9 +15,17 @@
 #include <algorithm>
 #include <cassert>
 #include <cstdio>
+
+#undef HAVE_LIBEDIT
+
 #ifdef HAVE_LIBEDIT
 #include <histedit.h>
 #endif
+
+#include "replxx.hxx"
+#include <regex>
+
+using Replxx = replxx::Replxx;
 
 using namespace llvm;
 
@@ -212,6 +220,8 @@ LineEditor::LineEditor(StringRef ProgName, StringRef HistoryPath, FILE *In,
   Data->EL = ::el_init(ProgName.str().c_str(), In, Out, Err);
   assert(Data->EL);
 
+  // https://www.reddit.com/r/cpp/comments/825b7w/replxx_readlinelibedit_replacement_library_now/
+
   ::el_set(Data->EL, EL_PROMPT, ElGetPromptFn);
   ::el_set(Data->EL, EL_EDITOR, "emacs");
   ::el_set(Data->EL, EL_HIST, history, Data->Hist);
@@ -224,6 +234,8 @@ LineEditor::LineEditor(StringRef ProgName, StringRef HistoryPath, FILE *In,
            NULL); // Delete previous word, behave like bash does.
   ::el_set(Data->EL, EL_BIND, "\033[3~", "ed-delete-next-char",
            NULL); // Fix the delete key.
+  ::el_set(Data->EL, EL_BIND, "\\e[1;5C", "em-next-word", NULL);
+  ::el_set(Data->EL, EL_BIND, "\\e[1;5D", "ed-prev-word", NULL);
   ::el_set(Data->EL, EL_CLIENTDATA, Data.get());
 
   HistEvent HE;
@@ -277,49 +289,196 @@ Optional<std::string> LineEditor::readLine() const {
 
 #else // HAVE_LIBEDIT
 
-// Simple fgets-based implementation.
 
 struct LineEditor::InternalData {
-  FILE *In;
+  LineEditor *LE;
+
+  Replxx rx;
+
   FILE *Out;
+
+  using cl = Replxx::Color;
+
+  std::vector<std::pair<std::string, cl>> regex_color {
+
+    // commands
+    {"^\\s*help\\b", cl::BRIGHTMAGENTA},
+    {"^\\s*quit\\b", cl::BRIGHTMAGENTA},
+    {"^\\s*set\\b", cl::BRIGHTMAGENTA},
+    {"^\\s*enable\\b", cl::BRIGHTMAGENTA},
+    {"^\\s*disable\\b", cl::BRIGHTMAGENTA},
+    {"^\\s*match\\b", cl::BRIGHTMAGENTA},
+    {"^\\s*let\\b", cl::BRIGHTMAGENTA},
+    {"^\\s*m\\b", cl::BRIGHTMAGENTA},
+    {"^\\s*l\\b", cl::BRIGHTMAGENTA},
+    {"^\\s*q\\b", cl::BRIGHTMAGENTA},
+
+    {"true", cl::YELLOW},
+    {"false", cl::YELLOW},
+    {"[0-9]+", cl::BLUE},
+
+    // strings
+    {"\".*?\"", cl::YELLOW}, // double quotes
+    {"\'.*?\'", cl::YELLOW}, // single quotes
+  };
+
+
 };
+
+Replxx::completions_t hook_completion(std::string const& context, int index, void* user_data) {
+
+  if (!context.empty() && context.back() == ',')
+    return {};
+
+  auto Data = static_cast<LineEditor::InternalData*>(user_data);
+
+    LineEditor::CompletionAction Action = Data->LE->getCompletionAction(context, context.size());
+
+    switch (Action.Kind) {
+    case LineEditor::CompletionAction::AK_Insert: {
+      if (!Action.Text.empty()) {
+       if (Action.Text.back() == '"') {
+        Action.Text.append("\")");
+        Action.Text.append(std::string(2, 2));
+      }
+       if (Action.Text.back() == '(') {
+        Action.Text.append(")");
+        Action.Text.append(std::string(1, 2));
+      }
+      }
+      return { context.substr(index) + Action.Text };
+    }
+    case LineEditor::CompletionAction::AK_ShowCompletions: {
+      return Action.Completions;
+    }
+    }
+    return {};
+}
+
+Replxx::hints_t hook_hint(std::string const& context, int index, Replxx::Color& color, void* user_data) {
+
+  if (!context.empty() && context.back() == ',')
+    return {};
+  
+  auto Data = static_cast<LineEditor::InternalData*>(user_data);
+
+    LineEditor::CompletionAction Action = Data->LE->getCompletionAction(context, context.size());
+
+    switch (Action.Kind) {
+    case LineEditor::CompletionAction::AK_Insert:
+      return { Action.Text };
+    case LineEditor::CompletionAction::AK_ShowCompletions:
+    {
+      Replxx::completions_t res;
+      std::transform(Action.Completions.begin(), Action.Completions.end(), std::back_inserter(res), [&context, index](std::string const& item){
+          return item.substr(context.size() - index);
+      });
+      return res;
+    }
+    }
+    return {};
+}
+
+int real_len( std::string const& s ) {
+  int len( 0 );
+  char m4( 128 + 64 + 32 + 16 );
+  char m3( 128 + 64 + 32 );
+  char m2( 128 + 64 );
+  for ( int i( 0 ); i < static_cast<int>( s.length() ); ++ i, ++ len ) {
+    char c( s[i] );
+    if ( ( c & m4 ) == m4 ) {
+      i += 3;
+    } else if ( ( c & m3 ) == m3 ) {
+      i += 2;
+    } else if ( ( c & m2 ) == m2 ) {
+      i += 1;
+    }
+  }
+  return ( len );
+}
+
+void hook_color(std::string const& context, Replxx::colors_t& colors, void* user_data) {
+  auto Data = static_cast<LineEditor::InternalData*>(user_data);
+
+  // highlight matching regex sequences
+  for (auto const& e : Data->regex_color) {
+    size_t pos {0};
+    std::string str = context;
+    std::smatch match;
+
+    while(std::regex_search(str, match, std::regex(e.first))) {
+      std::string c {match[0]};
+      pos += real_len( match.prefix() );
+      int len( real_len( c ) );
+
+      for (int i = 0; i < len; ++i) {
+        colors.at(pos + i) = e.second;
+      }
+
+      pos += len;
+      str = match.suffix();
+    }
+  }
+}
+
 
 LineEditor::LineEditor(StringRef ProgName, StringRef HistoryPath, FILE *In,
                        FILE *Out, FILE *Err)
-    : Prompt((ProgName + "> ").str()), Data(new InternalData) {
-  Data->In = In;
+    : Prompt((ProgName + "> ").str()), HistoryPath(HistoryPath),
+      Data(new InternalData) {
+  if (HistoryPath.empty())
+    this->HistoryPath = getDefaultHistoryPath(ProgName);
+
   Data->Out = Out;
+
+  Data->LE = this;
+
+  Data->rx.install_window_change_handler();
+
+  // set the max history size
+  Data->rx.set_max_history_size(120);
+
+  // set the max input line size
+  Data->rx.set_max_line_size(9999);
+
+  // set the max number of hint rows to show
+  Data->rx.set_max_hint_rows(8);
+
+  // set the callbacks
+  Data->rx.set_completion_callback(hook_completion, static_cast<void*>(Data.get()));
+  Data->rx.set_highlighter_callback(hook_color, static_cast<void*>(Data.get()));
+  Data->rx.set_hint_callback(hook_hint, static_cast<void*>(Data.get()));
+
+  loadHistory();
 }
 
 LineEditor::~LineEditor() {
-  ::fwrite("\n", 1, 1, Data->Out);
+  saveHistory();
 }
 
-void LineEditor::saveHistory() {}
-void LineEditor::loadHistory() {}
+void LineEditor::saveHistory() {
+  Data->rx.history_save(this->HistoryPath);
+}
+void LineEditor::loadHistory() {
+  Data->rx.history_load(this->HistoryPath);
+}
 
 Optional<std::string> LineEditor::readLine() const {
-  ::fprintf(Data->Out, "%s", Prompt.c_str());
+    char const* cinput{ nullptr };
 
-  std::string Line;
-  do {
-    char Buf[64];
-    char *Res = ::fgets(Buf, sizeof(Buf), Data->In);
-    if (!Res) {
-      if (Line.empty())
-        return Optional<std::string>();
-      else
-        return Line;
+    do {
+      cinput = Data->rx.input("\033[0;32m" + this->Prompt + "\033[0m");
+    } while ( ( cinput == nullptr ) && ( errno == EAGAIN ) );
+
+    if (cinput == nullptr) {
+      return {};
     }
-    Line.append(Buf);
-  } while (Line.empty() ||
-           (Line[Line.size() - 1] != '\n' && Line[Line.size() - 1] != '\r'));
 
-  while (!Line.empty() &&
-         (Line[Line.size() - 1] == '\n' || Line[Line.size() - 1] == '\r'))
-    Line.resize(Line.size() - 1);
+    std::string input{cinput};
 
-  return Line;
+    Data->rx.history_add(input);
+
+    return input;
 }
 
 #endif // HAVE_LIBEDIT

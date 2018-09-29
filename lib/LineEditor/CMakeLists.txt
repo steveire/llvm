@@ -12,3 +12,9 @@ add_llvm_library(LLVMLineEditor
   LLVMSupport
   ${link_libs}
   )
+
+add_subdirectory(replxx)
+target_link_libraries(LLVMLineEditor 
+    PRIVATE
+    Replxx::Replxx
+)
